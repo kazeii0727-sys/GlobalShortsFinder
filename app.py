@@ -1,16 +1,17 @@
 
-import os
 import csv
 import io
+import os
 import re
+import uuid
 from datetime import datetime, timedelta, timezone
-from urllib.parse import urlencode
-
-from flask import Flask, request, render_template_string, Response
+from flask import Flask, request, render_template_string, make_response
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 app = Flask(__name__)
 
-API_KEY = os.environ.get("YOUTUBE_API_KEY", "")
+API_KEY = os.environ.get("YOUTUBE_API_KEY", "").strip()
 
 COUNTRIES = {
     "US": "미국",
@@ -20,595 +21,722 @@ COUNTRIES = {
     "AU": "호주",
     "IN": "인도",
     "BR": "브라질",
-    "KR": "한국",
+    "KR": "대한민국",
+    "MX": "멕시코",
+    "DE": "독일",
+    "FR": "프랑스",
+    "ES": "스페인",
+    "IT": "이탈리아",
+    "ID": "인도네시아",
+    "PH": "필리핀",
+    "TH": "태국",
 }
 
-LANGUAGE_BY_COUNTRY = {
-    "US": "en",
-    "GB": "en",
-    "JP": "ja",
-    "CA": "en",
-    "AU": "en",
-    "IN": "en",
-    "BR": "pt",
-    "KR": "ko",
+LANGUAGES = {
+    "US": "en", "GB": "en", "CA": "en", "AU": "en",
+    "JP": "ja", "KR": "ko", "IN": "en", "BR": "pt",
+    "MX": "es", "DE": "de", "FR": "fr", "ES": "es",
+    "IT": "it", "ID": "id", "PH": "en", "TH": "th",
 }
 
-PAGE = """
-<!DOCTYPE html>
+# Render 인스턴스 메모리에 최근 검색 결과를 보관합니다.
+# 재배포나 서버 재시작 시 초기화될 수 있습니다.
+LAST_RESULTS = {}
+
+
+HTML = r"""
+<!doctype html>
 <html lang="ko">
 <head>
-<meta charset="UTF-8">
+<meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Global Shorts Finder</title>
 <style>
+:root {
+  color-scheme: dark;
+  --bg: #0b1020;
+  --panel: #131b2e;
+  --panel2: #19243a;
+  --text: #f4f7ff;
+  --muted: #a8b4cb;
+  --line: #2b3954;
+  --accent: #70e1c1;
+  --blue: #7ea7ff;
+}
 * { box-sizing: border-box; }
 body {
-    margin: 0;
-    background: #10131b;
-    color: #f1f5f9;
-    font-family: Arial, sans-serif;
+  margin: 0;
+  background: radial-gradient(circle at top right, #17294a, var(--bg) 45%);
+  color: var(--text);
+  font-family: Arial, "Malgun Gothic", sans-serif;
 }
-main { max-width: 1150px; margin: auto; padding: 24px; }
-h1 { font-size: 28px; }
-.sub { color: #aab4c5; margin-bottom: 24px; }
+main { max-width: 1250px; margin: auto; padding: 28px 18px 60px; }
+h1 { margin: 0 0 8px; font-size: clamp(27px, 4vw, 42px); }
+p { line-height: 1.6; }
+.subtitle { color: var(--muted); margin-top: 0; }
 .panel {
-    background: #1b2130;
-    padding: 20px;
-    border-radius: 14px;
-    margin-bottom: 20px;
+  background: rgba(19, 27, 46, .96);
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  padding: 20px;
+  margin-top: 18px;
 }
-form {
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 15px;
+.formgrid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 15px;
 }
-label {
-    display: block;
-    margin-bottom: 7px;
-    font-size: 14px;
-    color: #cbd5e1;
-}
+.field { display: flex; flex-direction: column; gap: 7px; }
+label { font-size: 13px; color: #d5deef; }
 input, select {
-    width: 100%;
-    padding: 12px;
-    border-radius: 8px;
-    border: 1px solid #3b4558;
-    background: #101723;
-    color: white;
+  width: 100%;
+  min-width: 0;
+  padding: 12px;
+  border-radius: 10px;
+  color: var(--text);
+  background: #0d1527;
+  border: 1px solid #354562;
+  font-size: 14px;
 }
-button {
-    grid-column: 1 / -1;
-    padding: 14px;
-    background: #ef4444;
-    border: 0;
-    border-radius: 8px;
-    color: white;
-    font-weight: bold;
-    font-size: 16px;
-    cursor: pointer;
+.checkrow {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin-top: 17px;
+  color: #d8e2f3;
+  font-size: 14px;
+  line-height: 1.5;
 }
-.grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(270px, 1fr));
-    gap: 18px;
+.checkrow input { width: auto; margin-top: 4px; }
+.help { color: var(--muted); font-size: 12px; line-height: 1.6; }
+button, .btn {
+  display: inline-block;
+  border: 0;
+  border-radius: 10px;
+  padding: 12px 17px;
+  background: var(--accent);
+  color: #071a19;
+  font-weight: 800;
+  text-decoration: none;
+  cursor: pointer;
+  font-size: 14px;
 }
-.card {
-    background: #1b2130;
-    border-radius: 12px;
-    overflow: hidden;
+button:hover, .btn:hover { filter: brightness(1.08); }
+.actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 18px; }
+.secondary { background: #263854; color: white; }
+.stats {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
 }
-.card img {
-    width: 100%;
-    aspect-ratio: 16 / 9;
-    object-fit: cover;
+.stat {
+  padding: 15px;
+  background: var(--panel2);
+  border: 1px solid var(--line);
+  border-radius: 13px;
 }
-.content { padding: 15px; }
-.content h3 { font-size: 16px; line-height: 1.5; }
-.meta {
-    font-size: 13px;
-    color: #b8c2d2;
-    line-height: 1.9;
-    overflow-wrap: anywhere;
+.stat strong { display: block; font-size: 24px; margin-top: 7px; }
+.stat span { color: var(--muted); font-size: 12px; }
+.alert {
+  border-radius: 12px;
+  padding: 13px 15px;
+  background: #35251a;
+  border: 1px solid #81542f;
+  color: #ffe0bc;
+  line-height: 1.6;
+  margin-top: 16px;
 }
-a { color: #93c5fd; text-decoration: none; }
-.notice {
-    background: #332819;
-    color: #fcd9a0;
-    padding: 14px;
-    border-radius: 9px;
-    margin: 15px 0;
-    overflow-wrap: anywhere;
+.error {
+  background: #3b2028;
+  border-color: #9d4456;
+  color: #ffd8df;
 }
-.error { background: #422329; color: #fecaca; }
-.stats { line-height: 1.9; }
-.country-tag {
-    display: inline-block;
-    background: #153e35;
-    color: #86efac;
-    border-radius: 5px;
-    padding: 3px 7px;
-    font-size: 12px;
-    margin-top: 5px;
+.result-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
 }
-@media (max-width: 600px) {
-    main { padding: 14px; }
-    form { grid-template-columns: 1fr; }
-    .grid { grid-template-columns: 1fr; }
+.results {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 15px;
+  margin-top: 16px;
+}
+.video {
+  background: #10192b;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  overflow: hidden;
+  min-width: 0;
+}
+.thumb {
+  display: block;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  object-fit: cover;
+  background: #202c40;
+}
+.video-body { padding: 13px; }
+.video h3 { font-size: 15px; line-height: 1.5; margin: 0 0 8px; }
+.video h3 a { color: var(--text); text-decoration: none; }
+.video h3 a:hover { color: var(--accent); }
+.meta { color: var(--muted); font-size: 12px; line-height: 1.8; }
+.views { color: var(--accent); font-size: 17px; font-weight: 800; margin: 9px 0 4px; }
+.tag {
+  display: inline-block;
+  font-size: 11px;
+  padding: 4px 7px;
+  border-radius: 6px;
+  background: #203c3b;
+  color: #9df5df;
+  margin-top: 8px;
+}
+.empty { color: var(--muted); text-align: center; padding: 32px 10px; }
+footer { color: var(--muted); font-size: 12px; margin-top: 22px; line-height: 1.7; }
+@media (max-width: 850px) {
+  .formgrid, .results { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 560px) {
+  main { padding: 20px 12px 40px; }
+  .panel { padding: 14px; }
+  .formgrid, .results, .stats { grid-template-columns: 1fr; }
 }
 </style>
 </head>
 <body>
 <main>
-<h1>🌎 Global Shorts Finder</h1>
-<div class="sub">
-국가별 해외 유튜브 쇼츠 발굴 · 채널 국가 확인 필터 적용
-</div>
+  <h1>🌎 Global Shorts Finder</h1>
+  <p class="subtitle">국가별 해외 쇼츠 후보를 찾고 조회수 100만 회 이상인 영상을 확인하세요.</p>
 
-<div class="panel">
-<form method="get" action="/">
-<div>
-<label>검색 국가</label>
-<select name="country">
-{% for code, name in countries.items() %}
-<option value="{{ code }}"
-{% if code == country %}selected{% endif %}>
-{{ name }} ({{ code }})
-</option>
-{% endfor %}
-</select>
-</div>
+  <section class="panel">
+    <form method="get" action="/">
+      <div class="formgrid">
+        <div class="field">
+          <label for="q">검색어</label>
+          <input id="q" name="q" value="{{ q }}" placeholder="예: funny animals, street food" required>
+        </div>
+        <div class="field">
+          <label for="country">검색 국가</label>
+          <select id="country" name="country">
+            {% for code, name in countries.items() %}
+            <option value="{{ code }}" {% if code == country %}selected{% endif %}>{{ name }} ({{ code }})</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="field">
+          <label for="days">게시 기간</label>
+          <select id="days" name="days">
+            <option value="7" {% if days == "7" %}selected{% endif %}>최근 7일</option>
+            <option value="30" {% if days == "30" %}selected{% endif %}>최근 30일</option>
+            <option value="90" {% if days == "90" %}selected{% endif %}>최근 90일</option>
+            <option value="365" {% if days == "365" %}selected{% endif %}>최근 1년</option>
+            <option value="0" {% if days == "0" %}selected{% endif %}>전체 기간</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="min_views">최소 조회수</label>
+          <select id="min_views" name="min_views">
+            <option value="1000000" {% if min_views == "1000000" %}selected{% endif %}>100만 회 이상</option>
+            <option value="500000" {% if min_views == "500000" %}selected{% endif %}>50만 회 이상</option>
+            <option value="100000" {% if min_views == "100000" %}selected{% endif %}>10만 회 이상</option>
+            <option value="0" {% if min_views == "0" %}selected{% endif %}>조회수 제한 없음</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="pages">검색 페이지 수</label>
+          <select id="pages" name="pages">
+            <option value="1" {% if pages == 1 %}selected{% endif %}>1페이지 · 최대 50개 후보</option>
+            <option value="2" {% if pages == 2 %}selected{% endif %}>2페이지 · 최대 100개 후보</option>
+            <option value="3" {% if pages == 3 %}selected{% endif %}>3페이지 · 최대 150개 후보</option>
+            <option value="5" {% if pages == 5 %}selected{% endif %}>5페이지 · 최대 250개 후보</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="order">검색 정렬</label>
+          <select id="order" name="order">
+            <option value="relevance" {% if order == "relevance" %}selected{% endif %}>관련성 우선 · 추천</option>
+            <option value="date" {% if order == "date" %}selected{% endif %}>최신순</option>
+          </select>
+        </div>
+      </div>
 
-<div>
-<label>검색어 또는 주제</label>
-<input name="q" value="{{ q }}"
-placeholder="예: funny animals, dance, AI" required>
-</div>
+      <label class="checkrow">
+        <input type="checkbox" name="strict" value="1" {% if strict %}checked{% endif %}>
+        <span>
+          <strong>채널 국가 엄격 필터</strong><br>
+          채널에 공개된 국가 정보가 선택 국가와 일치하는 영상만 표시합니다.
+          <span class="help">국가 정보가 없거나 일치하지 않는 채널은 제외되므로 결과가 크게 줄 수 있습니다.</span>
+        </span>
+      </label>
 
-<div>
-<label>게시 기간</label>
-<select name="days">
-{% for n, label in [
-(1, '최근 24시간'),
-(7, '최근 7일'),
-(30, '최근 30일'),
-(90, '최근 90일')
-] %}
-<option value="{{ n }}"
-{% if n == days %}selected{% endif %}>
-{{ label }}
-</option>
-{% endfor %}
-</select>
-</div>
+      <div class="actions">
+        <button type="submit">🔎 쇼츠 검색</button>
+        <a class="btn secondary" href="/">초기화</a>
+      </div>
+      <p class="help">
+        페이지를 1개 늘릴 때마다 YouTube 검색 API 사용량이 추가됩니다.
+        5페이지 검색은 검색 API 호출을 최대 5회 사용합니다.
+      </p>
+    </form>
+  </section>
 
-<div>
-<label>최소 조회수</label>
-<select name="minimum">
-{% for n, label in [
-(1000000, '100만 회 이상'),
-(5000000, '500만 회 이상'),
-(10000000, '1,000만 회 이상')
-] %}
-<option value="{{ n }}"
-{% if n == minimum %}selected{% endif %}>
-{{ label }}
-</option>
-{% endfor %}
-</select>
-</div>
+  {% if error %}
+  <div class="alert error"><strong>검색 오류</strong><br>{{ error }}</div>
+  {% endif %}
 
-<div>
-<label>정렬 기준</label>
-<select name="order">
-<option value="viewCount"
-{% if order == 'viewCount' %}selected{% endif %}>
-조회수순
-</option>
-<option value="date"
-{% if order == 'date' %}selected{% endif %}>
-최신순
-</option>
-</select>
-</div>
+  {% if searched %}
+  <section class="panel">
+    <div class="result-head">
+      <div>
+        <h2 style="margin:0 0 5px;">검색 결과</h2>
+        <div class="help">{{ countries.get(country, country) }} · 검색어: {{ q }}</div>
+      </div>
+      {% if export_id %}
+      <a class="btn secondary" href="/export/{{ export_id }}">CSV 다운로드</a>
+      {% endif %}
+    </div>
 
-<button type="submit">🔎 선택 국가의 쇼츠 검색하기</button>
-</form>
-</div>
+    <div class="stats" style="margin-top:16px;">
+      <div class="stat"><span>검색 후보 영상</span><strong>{{ candidate_count }}</strong></div>
+      <div class="stat"><span>조건에 맞는 영상</span><strong>{{ results|length }}</strong></div>
+      <div class="stat"><span>조회수 기준</span><strong>{{ min_views_label }}</strong></div>
+    </div>
 
-{% if message %}
-<div class="notice {% if error %}error{% endif %}">
-{{ message }}
-</div>
-{% endif %}
+    {% if strict %}
+    <div class="alert">
+      엄격 필터가 켜져 있습니다. YouTube 채널의 공개 국가 정보가 없는 경우에도 해당 채널이 제외됩니다.
+    </div>
+    {% endif %}
 
-{% if searched and not error %}
-<div class="panel stats">
-검색 국가: <b>{{ countries[country] }} ({{ country }})</b><br>
-검색 결과: <b>{{ results|length }}개</b><br>
-최소 조회수: <b>{{ "{:,}".format(minimum) }}회</b><br>
-국가 필터: <b>채널 공개 국가가 선택 국가와 일치하는 영상</b>
+    {% if results %}
+    <div class="results">
+      {% for v in results %}
+      <article class="video">
+        <a href="{{ v.url }}" target="_blank" rel="noopener noreferrer">
+          <img class="thumb" src="{{ v.thumbnail }}" alt="영상 썸네일" loading="lazy">
+        </a>
+        <div class="video-body">
+          <h3><a href="{{ v.url }}" target="_blank" rel="noopener noreferrer">{{ v.title }}</a></h3>
+          <div class="meta">
+            채널: {{ v.channel }}<br>
+            게시일: {{ v.published }}<br>
+            길이: {{ v.duration_label }}<br>
+            채널 국가: {{ v.channel_country_label }}
+          </div>
+          <div class="views">{{ "{:,}".format(v.views) }}회 조회</div>
+          <span class="tag">쇼츠 후보 · 3분 이하</span>
+        </div>
+      </article>
+      {% endfor %}
+    </div>
+    {% else %}
+    <div class="empty">
+      조건에 맞는 영상이 없습니다.<br>
+      검색 페이지를 늘리거나 게시 기간을 넓히고, 필요하면 조회수 기준을 낮춰 보세요.
+    </div>
+    {% endif %}
+  </section>
+  {% endif %}
 
-{% if results %}
-<p><a href="{{ export_url }}">📥 검색 결과 CSV 다운로드</a></p>
-{% endif %}
-
-<p class="meta">
-검색 지역 및 언어 설정을 YouTube API에 전달하고,
-채널이 공개한 국가 정보가 선택 국가와 일치하는지 확인합니다.
-국가를 공개하지 않은 채널은 결과에서 제외됩니다.
-채널 국가 정보는 영상 촬영 장소나 시청자 국가와 반드시 같지는 않습니다.
-API가 반환한 영상 중 조건에 맞는 결과만 표시합니다.
-</p>
-</div>
-
-<div class="grid">
-{% for v in results %}
-<div class="card">
-<a href="{{ v.url }}" target="_blank" rel="noopener">
-<img src="{{ v.thumbnail }}" alt="영상 썸네일" loading="lazy">
-</a>
-<div class="content">
-<h3>
-<a href="{{ v.url }}" target="_blank" rel="noopener">
-{{ v.title }}
-</a>
-</h3>
-<div class="meta">
-채널: {{ v.channel }}<br>
-채널 국가: {{ countries.get(v.channel_country, v.channel_country) }}<br>
-조회수: <b>{{ "{:,}".format(v.views) }}</b><br>
-게시일: {{ v.published }}<br>
-영상 길이: {{ v.duration }}<br>
-분류: {{ v.kind }}
-</div>
-<span class="country-tag">국가 확인 완료</span>
-<p>
-<a href="{{ v.url }}" target="_blank" rel="noopener">
-▶ 유튜브에서 보기
-</a>
-</p>
-</div>
-</div>
-{% endfor %}
-</div>
-
-{% if not results %}
-<div class="panel">
-선택한 국가의 채널 중 조건에 맞는 영상이 없습니다.<br><br>
-검색어를 영어 또는 해당 국가의 언어로 바꾸거나,
-게시 기간을 늘리고 최소 조회수를 낮춰 다시 검색해 보세요.
-국가를 공개하지 않은 채널은 국가 확인이 되지 않아 제외됩니다.
-</div>
-{% endif %}
-{% endif %}
+  <footer>
+    안내: YouTube 검색 API가 반환한 후보 중 영상 길이, 조회수, 선택한 필터 조건으로 결과를 구성합니다.
+    YouTube의 국가 검색은 해당 국가에서 시청 가능한 영상을 중심으로 하며, 영상 제작자의 국적이나 실제 촬영 국가를 보장하지 않습니다.
+    쇼츠 여부는 길이 기준으로 추정하므로 일반 영상이 포함될 수 있습니다.
+  </footer>
 </main>
 </body>
 </html>
 """
 
 
-def duration_seconds(value):
+def parse_duration_seconds(duration):
+    """ISO 8601 형식의 영상 길이를 초 단위로 변환합니다."""
     match = re.fullmatch(
-        r"PT(?:(\\d+)H)?(?:(\\d+)M)?(?:(\\d+)S)?",
-        value or ""
+        r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?",
+        duration or ""
     )
     if not match:
         return 0
 
-    hours, minutes, seconds = (
-        int(part or 0) for part in match.groups()
-    )
+    hours = int(match.group(1) or 0)
+    minutes = int(match.group(2) or 0)
+    seconds = int(match.group(3) or 0)
     return hours * 3600 + minutes * 60 + seconds
 
 
-def duration_label(seconds):
+def format_duration(seconds):
     minutes, seconds = divmod(seconds, 60)
-
-    if minutes >= 60:
-        hours, minutes = divmod(minutes, 60)
-        return f"{hours}시간 {minutes}분"
-
-    return f"{minutes}분 {seconds}초"
+    if minutes:
+        return f"{minutes}:{seconds:02d}"
+    return f"0:{seconds:02d}"
 
 
-def chunks(values, size=50):
-    for start in range(0, len(values), size):
-        yield values[start:start + size]
+def format_published(value):
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).strftime("%Y-%m-%d")
+    except (ValueError, AttributeError):
+        return value or "정보 없음"
 
 
-def search_videos(country, query, days, minimum, order):
-    from googleapiclient.discovery import build
+def get_youtube_client():
+    if not API_KEY:
+        raise RuntimeError(
+            "Render 환경 변수 YOUTUBE_API_KEY가 설정되지 않았습니다. "
+            "Render 대시보드의 Environment 메뉴에서 API 키를 확인해 주세요."
+        )
 
-    youtube = build(
+    return build(
         "youtube",
         "v3",
         developerKey=API_KEY,
         cache_discovery=False
     )
 
-    published_after = (
-        datetime.now(timezone.utc) - timedelta(days=days)
-    ).isoformat(timespec="seconds").replace("+00:00", "Z")
 
-    # 국가별 지역 및 언어 관련성을 검색 요청에 적용합니다.
-    search_response = youtube.search().list(
-        part="snippet",
-        q=query,
-        type="video",
-        videoDuration="short",
-        order=order,
-        regionCode=country,
-        relevanceLanguage=LANGUAGE_BY_COUNTRY.get(country, "en"),
-        publishedAfter=published_after,
-        maxResults=50
-    ).execute()
+def search_video_candidates(youtube, query, country, days, pages, order):
+    """검색 API를 여러 페이지 호출해 중복 없는 영상 ID 목록을 수집합니다."""
+    published_after = None
+    if days > 0:
+        published_after = (
+            datetime.now(timezone.utc) - timedelta(days=days)
+        ).isoformat(timespec="seconds").replace("+00:00", "Z")
 
-    search_items = search_response.get("items", [])
-    video_ids = []
-    channel_ids = []
+    found = {}
+    page_token = None
 
-    for item in search_items:
-        video_id = item.get("id", {}).get("videoId")
-        channel_id = item.get("snippet", {}).get("channelId")
+    for _ in range(pages):
+        params = {
+            "part": "snippet",
+            "q": query,
+            "type": "video",
+            "regionCode": country,
+            "relevanceLanguage": LANGUAGES.get(country, "en"),
+            "videoDuration": "short",
+            "maxResults": 50,
+            "order": order,
+        }
 
-        if video_id and video_id not in video_ids:
-            video_ids.append(video_id)
+        if published_after:
+            params["publishedAfter"] = published_after
 
-        if channel_id and channel_id not in channel_ids:
-            channel_ids.append(channel_id)
+        if page_token:
+            params["pageToken"] = page_token
 
-    if not video_ids or not channel_ids:
-        return []
+        response = youtube.search().list(**params).execute()
 
-    # 채널이 공개한 국가 정보를 조회합니다.
-    channel_country = {}
+        for item in response.get("items", []):
+            video_id = item.get("id", {}).get("videoId")
+            if video_id and video_id not in found:
+                found[video_id] = item.get("snippet", {})
 
-    for channel_batch in chunks(channel_ids):
+        page_token = response.get("nextPageToken")
+        if not page_token:
+            break
+
+    return found
+
+
+def fetch_video_details(youtube, candidate_snippets):
+    """후보 영상의 실제 조회수, 길이, 썸네일 정보를 가져옵니다."""
+    video_ids = list(candidate_snippets.keys())
+    videos = {}
+
+    for start in range(0, len(video_ids), 50):
+        batch = video_ids[start:start + 50]
+        response = youtube.videos().list(
+            part="snippet,statistics,contentDetails",
+            id=",".join(batch),
+            maxResults=50
+        ).execute()
+
+        for item in response.get("items", []):
+            videos[item["id"]] = item
+
+    return videos
+
+
+def fetch_channel_countries(youtube, videos):
+    """채널에 공개된 국가 정보를 조회합니다."""
+    channel_ids = list({
+        item.get("snippet", {}).get("channelId")
+        for item in videos.values()
+        if item.get("snippet", {}).get("channelId")
+    })
+
+    countries = {}
+
+    for start in range(0, len(channel_ids), 50):
+        batch = channel_ids[start:start + 50]
         response = youtube.channels().list(
             part="snippet",
-            id=",".join(channel_batch),
+            id=",".join(batch),
             maxResults=50
         ).execute()
 
-        for channel in response.get("items", []):
-            snippet = channel.get("snippet", {})
-            channel_country[channel["id"]] = snippet.get("country", "")
+        for item in response.get("items", []):
+            countries[item["id"]] = item.get("snippet", {}).get("country", "")
 
-    # 국가 정보가 선택 국가와 일치하는 채널만 허용합니다.
-    matching_channel_ids = {
-        channel_id
-        for channel_id, channel_code in channel_country.items()
-        if channel_code == country
-    }
+    return countries
 
-    if not matching_channel_ids:
-        return []
 
+def build_results(youtube, candidates, country, min_views, strict):
+    videos = fetch_video_details(youtube, candidates)
+    channel_countries = fetch_channel_countries(youtube, videos)
     results = []
 
-    for video_batch in chunks(video_ids):
-        details_response = youtube.videos().list(
-            part="snippet,statistics,contentDetails",
-            id=",".join(video_batch),
-            maxResults=50
-        ).execute()
+    for video_id, item in videos.items():
+        snippet = item.get("snippet", {})
+        statistics = item.get("statistics", {})
+        content = item.get("contentDetails", {})
 
-        for item in details_response.get("items", []):
-            snippet = item.get("snippet", {})
-            statistics = item.get("statistics", {})
-            content = item.get("contentDetails", {})
-
-            channel_id = snippet.get("channelId", "")
-
-            if channel_id not in matching_channel_ids:
-                continue
-
+        try:
             views = int(statistics.get("viewCount", 0))
+        except (TypeError, ValueError):
+            views = 0
 
-            if views < minimum:
-                continue
+        duration_seconds = parse_duration_seconds(content.get("duration", ""))
 
-            seconds = duration_seconds(content.get("duration", ""))
+        # 쇼츠 후보를 최대 3분 길이로 제한합니다.
+        if duration_seconds <= 0 or duration_seconds > 180:
+            continue
 
-            thumbnails = snippet.get("thumbnails", {})
-            thumbnail_data = (
-                thumbnails.get("high")
-                or thumbnails.get("medium")
-                or thumbnails.get("default")
-                or {}
-            )
+        if views < min_views:
+            continue
 
-            if seconds <= 180:
-                kind = "쇼츠 후보 · 화면 비율 확인 필요"
-            else:
-                kind = "일반 영상 가능성 높음"
+        channel_id = snippet.get("channelId", "")
+        channel_country = channel_countries.get(channel_id, "")
 
-            results.append({
-                "title": snippet.get("title", ""),
-                "channel": snippet.get("channelTitle", ""),
-                "channel_country": country,
-                "views": views,
-                "published": snippet.get("publishedAt", "")[:10],
-                "duration": duration_label(seconds),
-                "kind": kind,
-                "thumbnail": thumbnail_data.get("url", ""),
-                "url": "https://www.youtube.com/watch?v=" + item["id"],
-                "video_id": item["id"]
-            })
+        if strict and channel_country != country:
+            continue
 
-    # API 결과 중복을 제거합니다.
-    unique_results = {}
-    for video in results:
-        unique_results[video["video_id"]] = video
-
-    results = list(unique_results.values())
-
-    if order == "viewCount":
-        results.sort(key=lambda video: video["views"], reverse=True)
-    else:
-        results.sort(
-            key=lambda video: video["published"],
-            reverse=True
+        thumbnails = snippet.get("thumbnails", {})
+        thumbnail = (
+            thumbnails.get("high", {}).get("url")
+            or thumbnails.get("medium", {}).get("url")
+            or thumbnails.get("default", {}).get("url")
+            or ""
         )
 
+        results.append({
+            "video_id": video_id,
+            "title": snippet.get("title", "제목 없음"),
+            "channel": snippet.get("channelTitle", "채널 정보 없음"),
+            "published": format_published(snippet.get("publishedAt", "")),
+            "views": views,
+            "duration_seconds": duration_seconds,
+            "duration_label": format_duration(duration_seconds),
+            "thumbnail": thumbnail,
+            "url": f"https://www.youtube.com/shorts/{video_id}",
+            "channel_country": channel_country,
+            "channel_country_label": COUNTRIES.get(
+                channel_country,
+                channel_country or "공개 정보 없음"
+            ),
+        })
+
+    results.sort(key=lambda item: item["views"], reverse=True)
     return results
 
 
-def read_search_options():
-    country = request.args.get("country", "US")
+def render_page(**overrides):
+    defaults = {
+        "q": "",
+        "country": "US",
+        "days": "30",
+        "min_views": "1000000",
+        "pages": 3,
+        "order": "relevance",
+        "strict": False,
+        "searched": False,
+        "results": [],
+        "candidate_count": 0,
+        "error": "",
+        "export_id": "",
+    }
+    defaults.update(overrides)
+
+    min_views = int(defaults["min_views"])
+    if min_views >= 1_000_000:
+        defaults["min_views_label"] = f"{min_views // 1_000_000}백만 회 이상"
+    elif min_views >= 1_000:
+        defaults["min_views_label"] = f"{min_views // 1_000}천 회 이상"
+    else:
+        defaults["min_views_label"] = "제한 없음"
+
+    return render_template_string(
+        HTML,
+        countries=COUNTRIES,
+        **defaults
+    )
+
+
+@app.route("/", methods=["GET"])
+def index():
+    q = request.args.get("q", "").strip()
+    country = request.args.get("country", "US").upper()
+    days_raw = request.args.get("days", "30")
+    min_views_raw = request.args.get("min_views", "1000000")
+    pages_raw = request.args.get("pages", "3")
+    order = request.args.get("order", "relevance")
+    strict = request.args.get("strict") == "1"
+
     if country not in COUNTRIES:
         country = "US"
 
-    query = request.args.get("q", "viral shorts").strip()[:150]
+    try:
+        days = int(days_raw)
+        if days not in (0, 7, 30, 90, 365):
+            days = 30
+    except ValueError:
+        days = 30
 
     try:
-        days = int(request.args.get("days", "7"))
+        min_views = int(min_views_raw)
+        if min_views not in (0, 100000, 500000, 1000000):
+            min_views = 1000000
     except ValueError:
-        days = 7
-
-    if days not in (1, 7, 30, 90):
-        days = 7
+        min_views = 1000000
 
     try:
-        minimum = int(request.args.get("minimum", "1000000"))
+        pages = int(pages_raw)
+        if pages not in (1, 2, 3, 5):
+            pages = 3
     except ValueError:
-        minimum = 1000000
+        pages = 3
 
-    if minimum not in (1000000, 5000000, 10000000):
-        minimum = 1000000
+    if order not in ("relevance", "date"):
+        order = "relevance"
 
-    order = request.args.get("order", "viewCount")
-    if order not in ("viewCount", "date"):
-        order = "viewCount"
-
-    return country, query, days, minimum, order
-
-
-def perform_search(country, query, days, minimum, order):
-    if not query:
-        raise ValueError("검색어를 입력해 주세요.")
-
-    if not API_KEY:
-        raise RuntimeError(
-            "YouTube API 키가 설정되지 않았습니다. "
-            "Render 환경 변수 YOUTUBE_API_KEY를 확인해 주세요."
+    if not q:
+        return render_page(
+            q=q, country=country, days=str(days),
+            min_views=str(min_views), pages=pages,
+            order=order, strict=strict
         )
 
-    return search_videos(country, query, days, minimum, order)
+    if len(q) > 200:
+        return render_page(
+            q=q[:200], country=country, days=str(days),
+            min_views=str(min_views), pages=pages,
+            order=order, strict=strict,
+            error="검색어는 200자 이내로 입력해 주세요."
+        )
 
+    try:
+        youtube = get_youtube_client()
 
-@app.route("/")
-def index():
-    country, query, days, minimum, order = read_search_options()
+        candidates = search_video_candidates(
+            youtube=youtube,
+            query=q,
+            country=country,
+            days=days,
+            pages=pages,
+            order=order
+        )
 
-    results = []
-    message = ""
-    error = False
-    searched = bool(request.args)
+        results = build_results(
+            youtube=youtube,
+            candidates=candidates,
+            country=country,
+            min_views=min_views,
+            strict=strict
+        )
 
-    if searched:
-        try:
-            results = perform_search(
-                country, query, days, minimum, order
-            )
-            if not results:
-                message = (
-                    "조건에 맞는 국가 확인 영상이 없습니다. "
-                    "검색어, 게시 기간 또는 최소 조회수를 바꿔보세요."
-                )
-        except ValueError as exc:
-            message = str(exc)
-            error = True
-        except RuntimeError as exc:
-            message = str(exc)
-            error = True
-        except Exception as exc:
-            app.logger.exception("YouTube search failed")
+        export_id = uuid.uuid4().hex
+        LAST_RESULTS[export_id] = results
+
+        # 메모리 사용량이 커지지 않도록 최근 검색 20개만 유지합니다.
+        while len(LAST_RESULTS) > 20:
+            LAST_RESULTS.pop(next(iter(LAST_RESULTS)))
+
+        return render_page(
+            q=q,
+            country=country,
+            days=str(days),
+            min_views=str(min_views),
+            pages=pages,
+            order=order,
+            strict=strict,
+            searched=True,
+            results=results,
+            candidate_count=len(candidates),
+            export_id=export_id
+        )
+
+    except RuntimeError as exc:
+        return render_page(
+            q=q, country=country, days=str(days),
+            min_views=str(min_views), pages=pages,
+            order=order, strict=strict,
+            error=str(exc)
+        )
+    except HttpError as exc:
+        status = getattr(exc.resp, "status", "알 수 없음")
+        if status == 403:
             message = (
-                "검색에 실패했습니다. YouTube API 키, API 활성화 상태, "
-                "쿼터 및 요청 설정을 확인해 주세요. "
-                f"오류 유형: {type(exc).__name__}"
+                "YouTube API 요청이 거부되었습니다. API 키, YouTube Data API v3 활성화 여부, "
+                "할당량 초과 여부를 확인해 주세요."
             )
-            error = True
-
-    export_url = "/export?" + urlencode({
-        "country": country,
-        "q": query,
-        "days": days,
-        "minimum": minimum,
-        "order": order
-    })
-
-    return render_template_string(
-        PAGE,
-        countries=COUNTRIES,
-        country=country,
-        q=query,
-        days=days,
-        minimum=minimum,
-        order=order,
-        results=results,
-        message=message,
-        error=error,
-        searched=searched,
-        export_url=export_url
-    )
-
-
-@app.route("/export")
-def export():
-    country, query, days, minimum, order = read_search_options()
-
-    try:
-        results = perform_search(
-            country, query, days, minimum, order
+        elif status == 400:
+            message = "YouTube 검색 요청이 올바르지 않습니다. 검색어를 바꿔 다시 시도해 주세요."
+        else:
+            message = f"YouTube API 오류가 발생했습니다. HTTP 상태 코드: {status}"
+        return render_page(
+            q=q, country=country, days=str(days),
+            min_views=str(min_views), pages=pages,
+            order=order, strict=strict, error=message
         )
-    except Exception:
-        app.logger.exception("CSV export failed")
+    except Exception as exc:
+        app.logger.exception("검색 처리 중 오류 발생")
+        return render_page(
+            q=q, country=country, days=str(days),
+            min_views=str(min_views), pages=pages,
+            order=order, strict=strict,
+            error=f"검색 중 오류가 발생했습니다: {exc}"
+        )
+
+
+@app.route("/export/<export_id>", methods=["GET"])
+def export_csv(export_id):
+    results = LAST_RESULTS.get(export_id)
+
+    if results is None:
         return (
-            "CSV 생성에 실패했습니다. API 키와 검색 조건을 확인해 주세요.",
-            502
+            "검색 결과가 만료되었거나 서버가 재시작되었습니다. "
+            "사이트에서 다시 검색한 뒤 CSV를 다운로드해 주세요.",
+            404
         )
 
-    output = io.StringIO(newline="")
+    output = io.StringIO()
     writer = csv.writer(output)
 
     writer.writerow([
-        "제목",
-        "채널",
-        "채널 국가",
-        "조회수",
-        "게시일",
-        "영상 길이",
-        "분류",
-        "영상 URL"
+        "제목", "채널", "조회수", "게시일",
+        "영상 길이", "채널 국가", "영상 URL"
     ])
 
-    for video in results:
+    for item in results:
         writer.writerow([
-            video["title"],
-            video["channel"],
-            video["channel_country"],
-            video["views"],
-            video["published"],
-            video["duration"],
-            video["kind"],
-            video["url"]
+            item["title"],
+            item["channel"],
+            item["views"],
+            item["published"],
+            item["duration_label"],
+            item["channel_country_label"],
+            item["url"],
         ])
 
-    csv_content = "\\ufeff" + output.getvalue()
-
-    return Response(
-        csv_content,
-        content_type="text/csv; charset=utf-8",
-        headers={
-            "Content-Disposition":
-                "attachment; filename=global_shorts_results.csv"
-        }
+    # Excel에서 한글이 깨지지 않도록 UTF-8 BOM을 추가합니다.
+    response = make_response("\ufeff" + output.getvalue())
+    response.headers["Content-Type"] = "text/csv; charset=utf-8"
+    response.headers["Content-Disposition"] = (
+        'attachment; filename="global_shorts_results.csv"'
     )
+    return response
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "10000"))
+    port = int(os.environ.get("PORT", "5000"))
     app.run(host="0.0.0.0", port=port)
